@@ -29,6 +29,8 @@ except ImportError:
 from open_clip import tokenize
 from open_clip.tokenizer import HFTokenizer
 
+from training.templates import get_templates
+
 
 class CsvDataset(Dataset):
     def __init__(self, input_filename, transforms, img_key, caption_key, sep="\t", tokenizer=None):
@@ -76,6 +78,13 @@ class DataInfo:
 
 
 def get_dataset_size(shards):
+    if '::' in shards:
+        sizes = [get_dataset_size(sub_shards) for sub_shards in shards.split('::')]
+        total_size_list, num_shards_list = list(zip(*sizes))
+        num_shards = sum(num_shards_list)
+        total_size = None if None in total_size_list else sum(total_size)
+        return total_size, num_shards
+
     shards_list = list(braceexpand.braceexpand(shards))
     dir_path = os.path.dirname(shards)
     sizes_filename = os.path.join(dir_path, 'sizes.json')
@@ -154,7 +163,7 @@ def count_samples(dataloader):
 
 
 def filter_no_caption_or_no_image(sample):
-    has_caption = ('txt' in sample)
+    has_caption = ('txt' in sample or 'json' in sample)
     has_image = ('png' in sample or 'jpg' in sample or 'jpeg' in sample)
     return has_caption and has_image 
 
@@ -288,6 +297,24 @@ class ResampledShards2(IterableDataset):
             yield dict(url=self.rng.choice(self.urls))
 
 
+def preprocess_text(inputs, args, tokenizer):
+    if isinstance(inputs, str):
+        # Used when inputs come from txt file (standard image-text pairs).
+        return tokenizer(inputs)[0]
+    elif isinstance(inputs, dict):
+        # Used for classification tasks. The inputs should contain a class name (str)
+        # and the dataset name, which is used to determine the templates. Templates
+        # are randomly chosen from the set of available templates for the dataset.
+        class_name = inputs['class_name']
+        dataset = inputs['dataset']
+        templates = get_templates(dataset)
+        template = random.choice(templates)
+        caption = template(class_name)
+        return tokenizer(caption)[0]
+    else:
+        raise ValueError(f'Unknown input type for inputs: {inputs}')
+
+
 def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokenizer=None):
     input_shards = args.train_data if is_train else args.val_data
     assert input_shards is not None
@@ -305,6 +332,7 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokeni
             num_samples = args.val_num_samples or 0  # eval will just exhaust the iterator if not specified
 
     shared_epoch = SharedEpoch(epoch=epoch)  # create a shared epoch store to sync epoch to dataloader worker proc
+    
     if resampled:
         pipeline = [ResampledShards2(input_shards, deterministic=True, epoch=shared_epoch)]
     else:
@@ -340,8 +368,8 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokeni
     pipeline.extend([
         wds.select(filter_no_caption_or_no_image),
         wds.decode("pilrgb", handler=log_and_continue),
-        wds.rename(image="jpg;png;jpeg", text="txt"),
-        wds.map_dict(image=preprocess_img, text=lambda text: tokenizer(text)[0]),
+        wds.rename(image="jpg;png;jpeg", text="txt;json"),
+        wds.map_dict(image=preprocess_img, text=lambda text: preprocess_text(text, args, tokenizer)),
         wds.to_tuple("image", "text"),
         wds.batched(args.batch_size, partial=not is_train),
     ])
